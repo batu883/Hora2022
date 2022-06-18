@@ -1,0 +1,229 @@
+#TENSORFLOW  BAĞLANTISI
+%tensorflow_version 1.x
+
+#Resimlerin drivedan çekilmesi için bağlantı
+from google.colab import drive
+drive.mount('/content/drive')
+
+#drive'a erişim izni 
+%cd /content/drive/MyDrive
+!ls
+
+
+
+import pandas as pd # CSV dosyaları  için veri işleme kütüphanesi
+import numpy as np
+import os
+from keras import backend as K
+from keras.preprocessing.image import load_img, save_img, img_to_array
+import matplotlib.pyplot as plt
+import random
+import tensorflow as tf
+from keras.applications import vgg19
+from keras.models import Model
+#from keras import optimizers
+from scipy.optimize import fmin_l_bfgs_b
+
+print(os.listdir("./BitirmeProjesi"))
+
+
+#İşleme giricek resimlerin adresleri
+BasePath = 'BitirmeProjesi/base_final/'
+StylePath = 'BitirmeProjesi/doku_final/'
+
+#İterasyon sayısı
+IterationNumber=200
+
+BaseImagePath = BasePath+'428771.jpg'
+SecondImagePath = StylePath+'abstract1.jpg'
+
+
+# Oluşturulan resmin boyutlarının belirlenmesi
+width, height = load_img(BaseImagePath).size
+img_nrows = 400
+img_ncols = int(width * img_nrows / height)
+
+
+#Resmin array olarak kaydedilmesi preprocessing yani inputun sayısal değere çevrilmesi
+def FirstOperationToImage(image_path):
+    from keras.applications import vgg19
+    img = load_img(image_path, target_size=(img_nrows, img_ncols))
+    img = img_to_array(img)
+    img = np.expand_dims(img, axis=0)
+    img = vgg19.preprocess_input(img)
+    return img
+
+
+
+plt.figure()
+plt.title("Base Image",fontsize=20)
+img1 = load_img(BaseImagePath)
+plt.imshow(img1)
+
+
+plt.figure()
+plt.title("Style Image",fontsize=20)
+img1 = load_img(SecondImagePath)
+plt.imshow(img1)
+
+# Resmimizin tensor için uygun temsil halinin alınması
+BaseImg = K.variable(FirstOperationToImage(BaseImagePath))
+style_reference_image = K.variable(FirstOperationToImage(SecondImagePath))
+
+K.image_data_format()
+
+
+# Oluşturulcak resmin datalarının tutulması / derinliğin ayarlanması
+if K.image_data_format() == 'channels_first':
+    combination_image = K.placeholder((1,3,img_nrows, img_ncols))
+else:
+    combination_image = K.placeholder((1,img_nrows, img_ncols,3))
+
+
+# 3 resmin tek bir keras tensöründe gösterilmesi(birleştirilmesi)
+input_tensor = K.concatenate([BaseImg,style_reference_image,combination_image], axis=0)
+
+
+
+# Resimler Vgg modeline dahil ediliyor
+# 
+from keras.applications.vgg19 import VGG19
+WeigthOfVGG19 = './BitirmeProjesi/vgg19/vgg19_weights_tf_dim_ordering_tf_kernels_notop.h5'
+model = VGG19(input_tensor=input_tensor,include_top = False,weights=WeigthOfVGG19)
+
+print('Model loaded.')
+
+
+# İçerik katmanlarının oluşturulması
+LayerContentImg = ['block5_conv2'] 
+
+# İşlem yaptığımız Stil katmanı(eklenen resim/2.resim)
+LayerSecondImg = ['block1_conv1','block2_conv1','block3_conv1', 'block4_conv1','block5_conv1']
+
+LayerContentNumber = len(LayerContentImg)
+LayerSecondNumber = len(LayerSecondImg)
+
+
+outputs_dict = dict([(layer.name, layer.output) for layer in model.layers])
+print(outputs_dict['block5_conv2'])
+
+
+# Oluşturulan görüntüde Base image'ın içeriği korur. Böylece Base image temel katman olarak kullanılır.
+def GetLoseInfo(base_content, target):
+    return K.sum(K.square(target - base_content))
+
+
+# Görüntünün matris halinin oluşturulması.
+def MatrixPixel(input_tensor):
+    assert K.ndim(input_tensor)==3
+   
+    channels = int(input_tensor.shape[-1])
+    a = tf.reshape(input_tensor, [-1, channels])
+    n = tf.shape(a)[0]
+    gram = tf.matmul(a, a, transpose_a=True)
+    return gram#/tf.cast(n, tf.float32)
+
+def GetSecondImgLoss(style, combination):
+    assert K.ndim(style) == 3
+    assert K.ndim(combination) == 3
+    S = MatrixPixel(style)
+    C = MatrixPixel(combination)
+    channels = 3
+    size = img_nrows*img_ncols
+    return K.sum(K.square(S - C))#/(4.0 * (channels ** 2) * (size ** 2))
+
+
+def SecondOperationToImage(x):
+    if K.image_data_format() == 'channels_first':
+        x = x.reshape((3, img_nrows, img_ncols))
+        x = x.transpose((1, 2, 0))
+    else:
+        x = x.reshape((img_nrows, img_ncols, 3))
+    # Ortalama piksele göre sıfır merkezini kaldırır. Böylece  oluşturulan resimdeki kaymaların önüne geçilir
+    x[:, :, 0] += 103.939
+    x[:, :, 1] += 116.779
+    x[:, :, 2] += 123.68
+    # 'BGR'->'RGB'
+    x = x[:, :, ::-1]
+    x = np.clip(x, 0, 255).astype('uint8')
+    return x
+
+
+# Still kaybını en aza indirgemek için oluşturulan görüntüyü optimize eder.
+x_opt = FirstOperationToImage(BaseImagePath)
+
+
+
+def eval_loss_and_grads(x):
+    if K.image_data_format() == 'channels_first':
+        x = x.reshape((1, 3, img_nrows, img_ncols))
+    else:
+        x = x.reshape((1, img_nrows, img_ncols, 3))
+    outs = f_outputs([x])
+    loss_value = outs[0]
+    if len(outs[1:]) == 1:
+        grad_values = outs[1].flatten().astype('float64')
+    else:
+        grad_values = np.array(outs[1:]).flatten().astype('float64')
+    return loss_value, grad_values
+
+
+class Marker(object):
+
+    def __init__(self):
+        self.loss_value = None
+        self.grads_values = None
+
+    def loss(self, x):
+        assert self.loss_value is None
+        loss_value, grad_values = eval_loss_and_grads(x)
+        self.loss_value = loss_value
+        self.grad_values = grad_values
+        return self.loss_value
+
+    def grads(self, x):
+        assert self.loss_value is not None
+        grad_values = np.copy(self.grad_values)
+        self.loss_value = None
+        self.grad_values = None
+        return grad_values
+
+
+# En iyi değeri saklar
+best_loss, best_img = float('inf'), None
+for i in range(IterationNumber):
+    print(i,'.Tekrar')
+    x_opt, min_val, info= fmin_l_bfgs_b(marker.loss, 
+                                        x_opt.flatten(), 
+                                        fprime=marker.grads,
+                                        maxfun=20, disp=True,
+                                       )
+    print('Tekrar sırasındaki değer kaybı:', min_val)
+    if min_val < best_loss:
+        # Toplam kayıp değerinden en iyi kaybu ve en iyi görüntüyü günceller
+        best_loss = min_val
+        best_img = x_opt.copy()
+
+
+# Oluşturulan resmi saklar
+imgx = SecondOperationToImage(best_img.copy())
+plt.imshow(imgx)
+
+
+
+plt.figure(figsize=(30,30))
+plt.subplot(5,5,1)
+plt.title("Base Image",fontsize=20)
+img_base = load_img(BaseImagePath)
+plt.imshow(img_base)
+
+plt.subplot(5,5,1+1)
+plt.title("Style Image",fontsize=20)
+img_style = load_img(SecondImagePath)
+plt.imshow(img_style)
+
+plt.subplot(5,5,1+2)
+plt.title("Final Image",fontsize=20)
+plt.imshow(imgx)
+
+
